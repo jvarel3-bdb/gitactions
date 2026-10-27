@@ -1,36 +1,187 @@
-# This is a basic workflow to help you get started with Actions
+name: Restart Apache Tomcat Service
+run-name: Restart Apache Tomcat Service
 
-name: GitActions
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_call:
+    inputs:
+      environm:
+        description: 'Ambiente qa, st o pr'
+        required: true
+        type: string
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+      name_host:
+        description: 'Runner donde se ejecutará el workflow'
+        required: true
+        type: string
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+      ip_server:
+        description: 'IP del servidor'
+        required: true
+        type: string
+
+      user_ssh:
+        description: 'Usuario SSH'
+        required: true
+        type: string
+
+      apache_service_name:
+        description: 'Service Name de Tomcat'
+        required: true
+        type: string
+
+    secrets:
+      password_user_ssh:
+        required: true
+
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+  restart_service:
+    runs-on: ${{ inputs.name_host }}
+    environment: ${{ inputs.environm }}
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
+    outputs:
+      deploy_result: ${{ steps.deploy_result_id.outputs.deploy_result }}
+
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v3
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Create Log File
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          repository=$(basename "$GITHUB_REPOSITORY")
+          repository_name="/hostrunner/workspace/$repository"
+
+          log="$repository_name/log_restart_${{ inputs.apache_service_name }}_${{ inputs.environm }}.lis"
+
+          echo "log=$log" >> $GITHUB_ENV
+
+          touch "$log"
+
+      - name: Restart Apache Tomcat Service
+        run: |
+
+          echo "----------------------------------------------------------------------------------------------" | tee -a "$log"
+          echo "Validando existencia del servicio '${{ inputs.apache_service_name }}'" | tee -a "$log"
+          echo "----------------------------------------------------------------------------------------------" | tee -a "$log"
+
+          if sshpass -p '${{ secrets.password_user_ssh }}' \
+             ssh -o StrictHostKeyChecking=no \
+             ${{ inputs.user_ssh }}@${{ inputs.ip_server }} \
+             "powershell -Command \"Get-Service -Name '${{ inputs.apache_service_name }}' -ErrorAction Stop\"" \
+             >> "$log" 2>&1
+          then
+
+            echo "Servicio encontrado. Reiniciando..." | tee -a "$log"
+
+            if sshpass -p '${{ secrets.password_user_ssh }}' \
+               ssh -o StrictHostKeyChecking=no \
+               ${{ inputs.user_ssh }}@${{ inputs.ip_server }} \
+               "powershell -Command \"Restart-Service -Name '${{ inputs.apache_service_name }}' -Force\""
+            then
+
+              echo "restart_result=SUCCESS" >> $GITHUB_ENV
+
+              echo "✅ Servicio reiniciado correctamente." | tee -a "$log"
+
+              echo ":white_check_mark: Servicio reiniciado correctamente." >> $GITHUB_STEP_SUMMARY
+
+            else
+
+              echo "❌ Error reiniciando servicio." | tee -a "$log"
+
+              echo ":boom: Error al reiniciar servicio." >> $GITHUB_STEP_SUMMARY
+
+              exit 1
+
+            fi
+
+          else
+
+            echo "❌ Servicio no encontrado." | tee -a "$log"
+
+            echo ":boom: El servicio no existe." >> $GITHUB_STEP_SUMMARY
+
+            exit 1
+
+          fi
+
+      - name: Validate Running Status
+        run: |
+
+          echo "----------------------------------------------------------------------------------------------" | tee -a "$log"
+          echo "Validando estado RUNNING..." | tee -a "$log"
+          echo "----------------------------------------------------------------------------------------------" | tee -a "$log"
+
+          max_attempts=6
+          delay=10
+
+          for attempt in $(seq 1 $max_attempts)
+          do
+
+            status=$(sshpass -p '${{ secrets.password_user_ssh }}' \
+                     ssh -o StrictHostKeyChecking=no \
+                     ${{ inputs.user_ssh }}@${{ inputs.ip_server }} \
+                     "powershell -Command \"(Get-Service -Name '${{ inputs.apache_service_name }}').Status\"" \
+                     | tr -d '\r')
+
+            echo "Intento $attempt -> Estado: $status" | tee -a "$log"
+
+            if [ "$status" = "Running" ]; then
+
+              echo "status_result=SUCCESS" >> $GITHUB_ENV
+
+              echo "✅ Servicio en estado RUNNING" | tee -a "$log"
+
+              echo ":white_check_mark: Servicio en estado RUNNING." >> $GITHUB_STEP_SUMMARY
+
+              exit 0
+
+            fi
+
+            sleep $delay
+
+          done
+
+          echo "❌ Servicio no quedó en RUNNING." | tee -a "$log"
+
+          echo ":boom: El servicio no alcanzó estado RUNNING." >> $GITHUB_STEP_SUMMARY
+
+          exit 1
+
+      - name: Validate Result
+        if: always()
+        id: deploy_result_id
+        run: |
+
+          if [ "${{ env.restart_result }}" = "SUCCESS" ] && \
+             [ "${{ env.status_result }}" = "SUCCESS" ]; then
+
+            echo "deploy_result=SUCCESS" >> $GITHUB_OUTPUT
+
+            echo "✅ Resultado final: SUCCESS" | tee -a "$log"
+
+          else
+
+            echo "deploy_result=FAILURE" >> $GITHUB_OUTPUT
+
+            echo "❌ Resultado final: FAILURE" | tee -a "$log"
+
+          fi
+
+      - name: Upload Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LOG_RESTART_SERVICE
+          path: ${{ env.log }}
+          retention-days: 1
+
+  send_email:
+    needs: [restart_service]
+    if: always()
+
+    uses: bdb-dns/bbog-mav-utilities-pipeline/.github/workflows/emails.yml@v1
+
+    with:
+      result: ${{ needs.restart_service.outputs.deploy_result }}
+      environm: ${{ inputs.environm }}
+      LOGS: 'LOG_RESTART_SERVICE'
+
+    secrets: inherit
