@@ -8,7 +8,7 @@ on:
 jobs:
   recover:
     runs-on:
-      labels: [self-hosted, windows, watchdog]
+      labels: [watchdog]
     env:
       SSH_USER: ${{ vars.SSH_USER }}
       SSH_HOST: ${{ vars.SSH_HOST }}
