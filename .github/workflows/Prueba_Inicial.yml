@@ -8,7 +8,6 @@ on:
 jobs:
   recover:
     runs-on:
-      group: actionsdev
       labels: [self-hosted, windows, watchdog]
     env:
       SSH_USER: ${{ vars.SSH_USER }}
