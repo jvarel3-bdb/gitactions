@@ -1,187 +1,55 @@
-name: Restart Apache Tomcat Service
-run-name: Restart Apache Tomcat Service
+name: Runner Watchdog (SSH)
 
 on:
-  workflow_call:
-    inputs:
-      environm:
-        description: 'Ambiente qa, st o pr'
-        required: true
-        type: string
-
-      name_host:
-        description: 'Runner donde se ejecutará el workflow'
-        required: true
-        type: string
-
-      ip_server:
-        description: 'IP del servidor'
-        required: true
-        type: string
-
-      user_ssh:
-        description: 'Usuario SSH'
-        required: true
-        type: string
-
-      apache_service_name:
-        description: 'Service Name de Tomcat'
-        required: true
-        type: string
-
-    secrets:
-      password_user_ssh:
-        required: true
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
 
 jobs:
-  restart_service:
-    runs-on: ${{ inputs.name_host }}
-    environment: ${{ inputs.environm }}
-
-    outputs:
-      deploy_result: ${{ steps.deploy_result_id.outputs.deploy_result }}
-
+  recover:
+    runs-on:
+      group: actionsdev
+      labels: [self-hosted, windows, watchdog]
+    env:
+      SSH_USER: ${{ vars.SSH_USER }}
+      SSH_HOST: ${{ vars.SSH_HOST }}
+      SSH_PASS: ${{ secrets.SSH_PASS }}
     steps:
-
-      - name: Create Log File
+      - name: Instalar Posh-SSH
+        shell: powershell
         run: |
-          repository=$(basename "$GITHUB_REPOSITORY")
-          repository_name="/hostrunner/workspace/$repository"
+          if (-not (Get-Module -ListAvailable Posh-SSH)) {
+            Install-Module Posh-SSH -Scope CurrentUser -Force -AllowClobber
+          }
 
-          log="$repository_name/log_restart_${{ inputs.apache_service_name }}_${{ inputs.environm }}.lis"
-
-          echo "log=$log" >> $GITHUB_ENV
-
-          touch "$log"
-
-      - name: Restart Apache Tomcat Service
+      - name: Revisar y levantar servicios de runners por SSH
+        shell: powershell
         run: |
+          Import-Module Posh-SSH
+          $sec  = ConvertTo-SecureString $env:SSH_PASS -AsPlainText -Force
+          $cred = New-Object PSCredential($env:SSH_USER, $sec)
 
-          echo "----------------------------------------------------------------------------------------------" | tee -a "$log"
-          echo "Validando existencia del servicio '${{ inputs.apache_service_name }}'" | tee -a "$log"
-          echo "----------------------------------------------------------------------------------------------" | tee -a "$log"
+          # Script que se ejecuta en el servidor remoto
+          $remote = @'
+          $svcs = Get-Service -Name 'actions.runner.*'
+          foreach ($s in $svcs) {
+            if ($s.Status -ne 'Running') {
+              Write-Output ("Levantando " + $s.Name + " (estaba " + $s.Status + ")")
+              Start-Service -Name $s.Name
+            }
+          }
+          Get-Service -Name 'actions.runner.*' | ForEach-Object { $.Name + ': ' + $.Status }
+          '@
+          # EncodedCommand evita problemas de comillas (el shell por defecto remoto es cmd)
+          $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($remote))
 
-          if sshpass -p '${{ secrets.password_user_ssh }}' \
-             ssh -o StrictHostKeyChecking=no \
-             ${{ inputs.user_ssh }}@${{ inputs.ip_server }} \
-             "powershell -Command \"Get-Service -Name '${{ inputs.apache_service_name }}' -ErrorAction Stop\"" \
-             >> "$log" 2>&1
-          then
-
-            echo "Servicio encontrado. Reiniciando..." | tee -a "$log"
-
-            if sshpass -p '${{ secrets.password_user_ssh }}' \
-               ssh -o StrictHostKeyChecking=no \
-               ${{ inputs.user_ssh }}@${{ inputs.ip_server }} \
-               "powershell -Command \"Restart-Service -Name '${{ inputs.apache_service_name }}' -Force\""
-            then
-
-              echo "restart_result=SUCCESS" >> $GITHUB_ENV
-
-              echo "✅ Servicio reiniciado correctamente." | tee -a "$log"
-
-              echo ":white_check_mark: Servicio reiniciado correctamente." >> $GITHUB_STEP_SUMMARY
-
-            else
-
-              echo "❌ Error reiniciando servicio." | tee -a "$log"
-
-              echo ":boom: Error al reiniciar servicio." >> $GITHUB_STEP_SUMMARY
-
-              exit 1
-
-            fi
-
-          else
-
-            echo "❌ Servicio no encontrado." | tee -a "$log"
-
-            echo ":boom: El servicio no existe." >> $GITHUB_STEP_SUMMARY
-
-            exit 1
-
-          fi
-
-      - name: Validate Running Status
-        run: |
-
-          echo "----------------------------------------------------------------------------------------------" | tee -a "$log"
-          echo "Validando estado RUNNING..." | tee -a "$log"
-          echo "----------------------------------------------------------------------------------------------" | tee -a "$log"
-
-          max_attempts=6
-          delay=10
-
-          for attempt in $(seq 1 $max_attempts)
-          do
-
-            status=$(sshpass -p '${{ secrets.password_user_ssh }}' \
-                     ssh -o StrictHostKeyChecking=no \
-                     ${{ inputs.user_ssh }}@${{ inputs.ip_server }} \
-                     "powershell -Command \"(Get-Service -Name '${{ inputs.apache_service_name }}').Status\"" \
-                     | tr -d '\r')
-
-            echo "Intento $attempt -> Estado: $status" | tee -a "$log"
-
-            if [ "$status" = "Running" ]; then
-
-              echo "status_result=SUCCESS" >> $GITHUB_ENV
-
-              echo "✅ Servicio en estado RUNNING" | tee -a "$log"
-
-              echo ":white_check_mark: Servicio en estado RUNNING." >> $GITHUB_STEP_SUMMARY
-
-              exit 0
-
-            fi
-
-            sleep $delay
-
-          done
-
-          echo "❌ Servicio no quedó en RUNNING." | tee -a "$log"
-
-          echo ":boom: El servicio no alcanzó estado RUNNING." >> $GITHUB_STEP_SUMMARY
-
-          exit 1
-
-      - name: Validate Result
-        if: always()
-        id: deploy_result_id
-        run: |
-
-          if [ "${{ env.restart_result }}" = "SUCCESS" ] && \
-             [ "${{ env.status_result }}" = "SUCCESS" ]; then
-
-            echo "deploy_result=SUCCESS" >> $GITHUB_OUTPUT
-
-            echo "✅ Resultado final: SUCCESS" | tee -a "$log"
-
-          else
-
-            echo "deploy_result=FAILURE" >> $GITHUB_OUTPUT
-
-            echo "❌ Resultado final: FAILURE" | tee -a "$log"
-
-          fi
-
-      - name: Upload Log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: LOG_RESTART_SERVICE
-          path: ${{ env.log }}
-          retention-days: 1
-
-  send_email:
-    needs: [restart_service]
-    if: always()
-
-    uses: bdb-dns/bbog-mav-utilities-pipeline/.github/workflows/emails.yml@v1
-
-    with:
-      result: ${{ needs.restart_service.outputs.deploy_result }}
-      environm: ${{ inputs.environm }}
-      LOGS: 'LOG_RESTART_SERVICE'
-
-    secrets: inherit
+          $session = New-SSHSession -ComputerName $env:SSH_HOST -Credential $cred -AcceptKey -ErrorAction Stop
+          try {
+            $r = Invoke-SSHCommand -SessionId $session.SessionId -Command "powershell -NoProfile -EncodedCommand $enc"
+            $r.Output | Tee-Object -Variable out
+            "### Servicios de runners" >> $env:GITHUB_STEP_SUMMARY
+            $out | ForEach-Object { "- $_" } >> $env:GITHUB_STEP_SUMMARY
+            if ($r.ExitStatus -ne 0) { Write-Error $r.Error; exit 1 }
+          } finally {
+            Remove-SSHSession -SessionId $session.SessionId | Out-Null
+          }
